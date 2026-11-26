@@ -1,5 +1,5 @@
 use eframe::egui;
-use crate::app::{begin_operation, AppState, ReLaunchApp};
+use crate::app::{begin_operation, AddPanelState, AppState, ReLaunchApp};
 use crate::identity::{AppIdentity, AppInfo};
 
 /// What the user did this frame that needs work outside the state lock.
@@ -9,6 +9,8 @@ struct FrameActions {
     run: Option<AppIdentity>,
     /// Favorites added/removed or list refreshed: tray menu must follow.
     tray_dirty: bool,
+    /// "+" button clicked: kick off installed-app enumeration in background.
+    load_installed: bool,
 }
 
 impl eframe::App for ReLaunchApp {
@@ -45,6 +47,47 @@ impl eframe::App for ReLaunchApp {
         if let Some(favorites) = tray_favorites {
             crate::tray::sync_menu(&favorites);
         }
+
+        // "添加应用"面板后台枚举。
+        if actions.load_installed {
+            let st = self.state.clone();
+            let ctx2 = ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name("relaunch-enum-installed".into())
+                .spawn(move || {
+                    unsafe {
+                        let _ = windows::Win32::System::Com::CoInitializeEx(
+                            None,
+                            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                        );
+                    }
+                    let st2 = st.clone();
+                    let ctx3 = ctx2.clone();
+                    let apps = crate::installed::enumerate_installed(move |n| {
+                        if let Some(panel) = st2.lock().unwrap().add_panel.as_mut() {
+                            panel.scan_count = n;
+                        }
+                        ctx3.request_repaint();
+                    });
+                    if let Some(panel) = st.lock().unwrap().add_panel.as_mut() {
+                        panel.apps = Some(apps);
+                    }
+                    ctx2.request_repaint();
+                });
+        }
+
+        // 在面板打开时渲染它（在主锁外，单独获取锁）。
+        if self.state.lock().unwrap().add_panel.is_some() {
+            let mut tray_dirty_from_panel = false;
+            {
+                let mut state = self.state.lock().unwrap();
+                render_add_panel(ctx, &mut state, &mut tray_dirty_from_panel);
+            }
+            if tray_dirty_from_panel {
+                let favs = self.state.lock().unwrap().favorite_apps();
+                crate::tray::sync_menu(&favs);
+            }
+        }
     }
 }
 
@@ -52,8 +95,21 @@ fn render_toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut FrameAc
     ui.horizontal(|ui| {
         ui.heading("ReLaunch");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("⚙").on_hover_text("设置").clicked() {
-                // TODO: open settings panel
+            // "+" opens the add-app panel.
+            let panel_open = state.add_panel.is_some();
+            if ui
+                .selectable_label(panel_open, "+")
+                .on_hover_text("添加应用到收藏")
+                .clicked()
+            {
+                if panel_open {
+                    state.add_panel = None;
+                } else {
+                    let panel = AddPanelState { search: String::new(), apps: None, scan_count: 0 };
+                state.add_panel = Some(panel);
+                    // Kick off background enumeration.
+                    actions.load_installed = true;
+                }
             }
             let idle = state.restart_in_progress.is_none();
             if ui
@@ -183,4 +239,97 @@ fn render_status_bar(ui: &mut egui::Ui, state: &AppState) {
             ui.label(format!("共 {running_count} 个运行中的应用"));
         }
     });
+}
+
+/// "添加应用"浮动面板。
+/// `tray_dirty` 由调用方检查，收藏变化时重建托盘菜单。
+fn render_add_panel(ctx: &egui::Context, state: &mut AppState, tray_dirty: &mut bool) {
+    let Some(panel) = state.add_panel.as_mut() else { return };
+
+    let mut open = true;
+    egui::Window::new("添加应用到收藏")
+        .collapsible(false)
+        .resizable(true)
+        .min_width(320.0)
+        .min_height(300.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut panel.search)
+                    .hint_text("搜索…")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
+
+            match &panel.apps {
+                None => {
+                    let n = panel.scan_count;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        if n > 0 {
+                            ui.label(format!("正在扫描，已找到 {n} 个应用…"));
+                        } else {
+                            ui.label("正在扫描已安装应用…");
+                        }
+                    });
+                }
+                Some(apps) => {
+                    let query = panel.search.to_lowercase();
+                    let filtered: Vec<_> = apps
+                        .iter()
+                        .filter(|a| query.is_empty() || a.display_name.to_lowercase().contains(&query))
+                        .collect();
+
+                    if filtered.is_empty() {
+                        ui.weak("没有匹配的应用");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                for app in &filtered {
+                                    let already = state.config.is_favorite(&app.identity);
+                                    ui.horizontal(|ui| {
+                                        ui.label(&app.display_name);
+                                        ui.weak(match &app.identity {
+                                            crate::identity::AppIdentity::Msix { .. } => "MSIX",
+                                            crate::identity::AppIdentity::Win32 { .. } => "Win32",
+                                            crate::identity::AppIdentity::Manual { .. } => "手动",
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if already {
+                                                    ui.weak("已收藏");
+                                                } else if ui.button("收藏").clicked() {
+                                                    state.config.add_favorite(
+                                                        crate::config::FavoriteEntry {
+                                                            display_name: app.display_name.clone(),
+                                                            identity: app.identity.clone(),
+                                                            last_known_path: app.exe_path.clone(),
+                                                        },
+                                                    );
+                                                    if let Err(e) = state.config.save() {
+                                                        state.status_message =
+                                                            Some(format!("保存配置失败: {e}"));
+                                                    } else {
+                                                        state.status_message = Some(format!(
+                                                            "已将 {} 加入收藏",
+                                                            app.display_name
+                                                        ));
+                                                    }
+                                                    *tray_dirty = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                }
+            }
+        });
+
+    if !open {
+        state.add_panel = None;
+    }
 }

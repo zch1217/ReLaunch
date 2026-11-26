@@ -5,6 +5,7 @@ mod config;
 mod discovery;
 mod icon;
 mod icon_extract;
+mod installed;
 mod identity;
 mod launcher;
 mod process;

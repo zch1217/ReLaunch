@@ -21,6 +21,17 @@ pub struct AppState {
     pub tray_stale: bool,
     /// Icon textures loaded on the UI thread, keyed by exe path or AUMID.
     pub icon_cache: HashMap<String, egui::TextureHandle>,
+    /// "添加应用"面板状态，None 表示面板关闭。
+    pub add_panel: Option<AddPanelState>,
+}
+
+/// State for the "添加应用" picker panel.
+pub struct AddPanelState {
+    pub search: String,
+    /// None = still loading; Some = loaded (may be empty).
+    pub apps: Option<Vec<crate::installed::InstalledApp>>,
+    /// Count of apps found so far, updated while loading.
+    pub scan_count: usize,
 }
 
 impl Default for AppState {
@@ -33,6 +44,7 @@ impl Default for AppState {
             status_message: None,
             tray_stale: false,
             icon_cache: HashMap::new(),
+            add_panel: None,
         }
     }
 }
