@@ -252,9 +252,7 @@ pub struct ReLaunchApp {
 impl ReLaunchApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
-        let mut state = AppState::new();
-        state.refresh_apps();
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(Mutex::new(AppState::new()));
 
         let hwnd = main_hwnd(cc);
         let tray_ok = match crate::tray::install(state.clone(), cc.egui_ctx.clone(), hwnd) {
@@ -264,6 +262,32 @@ impl ReLaunchApp {
                 false
             }
         };
+
+        // Kick off initial app discovery in the background so the window opens
+        // immediately without waiting ~0.1-3 s for the scan to finish.
+        {
+            let bg_state = state.clone();
+            let ctx = cc.egui_ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name("relaunch-init-refresh".into())
+                .spawn(move || {
+                    unsafe {
+                        let _ = windows::Win32::System::Com::CoInitializeEx(
+                            None,
+                            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                        );
+                    }
+                    let favorites = bg_state.lock().unwrap().favorite_identities();
+                    let apps = crate::discovery::discover_with_favorites(&favorites);
+                    {
+                        let mut s = bg_state.lock().unwrap();
+                        s.apply_discovery(apps);
+                        s.tray_stale = true;
+                    }
+                    ctx.request_repaint();
+                });
+        }
+
         Self { state, tray_ok }
     }
 }
@@ -301,6 +325,8 @@ fn install_cjk_font(ctx: &eframe::egui::Context) {
     fonts
         .font_data
         .insert("cjk".to_owned(), FontData::from_owned(bytes));
+    // Append as fallback — egui's built-in fonts (including the icon glyphs)
+    // stay at the front and are tried first. CJK fills in what they miss.
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         fonts.families.entry(family).or_default().push("cjk".to_owned());
     }
