@@ -1,0 +1,16 @@
+# Build output
+/target/
+
+# User config and test files
+/target/testtools/
+
+# Editor and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Rust
+Cargo.lock
