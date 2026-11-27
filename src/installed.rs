@@ -323,7 +323,7 @@ fn lnk_to_installed(lnk_path: &Path) -> Option<InstalledApp> {
     })
 }
 
-fn resolve_squirrel_exe(update_dir: &Path, proc_exe: &str) -> Option<String> {
+pub(crate) fn resolve_squirrel_exe(update_dir: &Path, proc_exe: &str) -> Option<String> {
     let mut app_dirs = Vec::new();
     if let Ok(entries) = std::fs::read_dir(update_dir) {
         for entry in entries.flatten() {
@@ -346,7 +346,7 @@ fn resolve_squirrel_exe(update_dir: &Path, proc_exe: &str) -> Option<String> {
     }
 }
 
-fn parse_process_start(args: &str) -> Option<String> {
+pub(crate) fn parse_process_start(args: &str) -> Option<String> {
     let mut chars = args.chars().peekable();
     let mut expect_value = false;
     while let Some(&c) = chars.peek() {

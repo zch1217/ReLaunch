@@ -18,6 +18,15 @@ pub enum LaunchEntry {
     ExePath(String),
 }
 
+/// Captured launch parameters and working directory from a live Win32 process,
+/// applied when restarting directly via `LaunchEntry::ExePath`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchContext {
+    pub args: Option<String>,
+    pub working_dir: Option<String>,
+    pub source_exe: Option<String>,
+}
+
 impl LaunchEntry {
     pub fn describe(&self) -> String {
         match self {
@@ -50,7 +59,7 @@ pub fn resolve_launch_entry(identity: &AppIdentity, path_hint: Option<&str>) -> 
             resolve_win32_entry(exe_name, product_name, path_hint)
         }
         AppIdentity::Manual { path } => {
-            if std::path::Path::new(path).exists() {
+            if std::path::Path::new(path).is_file() {
                 Some(LaunchEntry::ExePath(path.clone()))
             } else {
                 None
@@ -76,11 +85,11 @@ pub(crate) fn is_aumid_registered(aumid: &str) -> bool {
 
 fn resolve_win32_entry(exe_name: &str, product_name: &str, path_hint: Option<&str>) -> Option<LaunchEntry> {
     // Resolution order (re-evaluated every call, never cached):
-    // 1. App Paths registry (HKCU, then HKLM)
+    // 1. App Paths registry (HKCU, then HKLM), verified against Win32 identity
     // 2. Start menu shortcuts (per-user, then all-users)
     // 3. Desktop shortcuts (per-user, then public)
-    // 4. Running / last-known EXE path, if the file still exists
-    if let Some(path) = try_app_paths_registry(exe_name) {
+    // 4. Running / last-known EXE path, verified against Win32 identity
+    if let Some(path) = try_app_paths_registry(exe_name, product_name) {
         return Some(LaunchEntry::ExePath(path));
     }
     for dir in shortcut_dirs() {
@@ -89,65 +98,121 @@ fn resolve_win32_entry(exe_name: &str, product_name: &str, path_hint: Option<&st
         }
     }
     if let Some(hint) = path_hint {
-        let p = std::path::Path::new(hint);
-        let name_matches = p
-            .file_name()
-            .map(|n| n.to_string_lossy().eq_ignore_ascii_case(exe_name))
-            .unwrap_or(false);
-        if name_matches && p.exists() {
+        if crate::discovery::exe_matches_win32_identity(hint, exe_name, product_name) {
             return Some(LaunchEntry::ExePath(hint.to_string()));
         }
     }
     None
 }
 
-/// Check HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}
-fn try_app_paths_registry(exe_name: &str) -> Option<String> {
+/// Check HKCU then HKLM `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}`,
+/// verifying that the target EXE matches `exe_name` and `product_name`.
+fn try_app_paths_registry(exe_name: &str, product_name: &str) -> Option<String> {
     let key_path = format!(
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{}",
         exe_name
     );
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
-        REG_VALUE_TYPE,
+        RegOpenKeyExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
     };
 
-    unsafe {
-        let wide_key: Vec<u16> = key_path.encode_utf16().chain([0]).collect();
+    let wide_key: Vec<u16> = key_path.encode_utf16().chain([0]).collect();
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
         let mut hkey = windows::Win32::System::Registry::HKEY::default();
-        let opened = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().any(|root| {
-            RegOpenKeyExW(root, PCWSTR(wide_key.as_ptr()), 0, KEY_READ, &mut hkey).is_ok()
-        });
-        if !opened {
-            return None;
+        if unsafe { RegOpenKeyExW(root, PCWSTR(wide_key.as_ptr()), 0, KEY_READ, &mut hkey) }.is_err()
+        {
+            continue;
         }
+        let Some(raw) = query_registry_default_string(hkey) else {
+            continue;
+        };
+        let Some(path) = parse_app_paths_value(&raw) else {
+            continue;
+        };
+        if crate::discovery::exe_matches_win32_identity(&path, exe_name, product_name) {
+            return Some(path);
+        }
+    }
+    None
+}
 
-        let mut data = vec![0u16; 1024];
-        let mut data_size = (data.len() * 2) as u32;
-        let mut vtype = REG_VALUE_TYPE::default();
-        let wide_name: Vec<u16> = vec![0u16]; // empty → default value
-        let result = RegQueryValueExW(
+fn query_registry_default_string(hkey: windows::Win32::System::Registry::HKEY) -> Option<String> {
+    use windows::Win32::{
+        Foundation::ERROR_MORE_DATA,
+        System::Registry::{RegCloseKey, RegQueryValueExW, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE},
+    };
+
+    let wide_name: Vec<u16> = vec![0u16]; // empty -> default value
+    let mut data = vec![0u16; 1024];
+    let mut data_size = (data.len() * 2) as u32;
+    let mut vtype = REG_VALUE_TYPE::default();
+
+    let mut result = unsafe {
+        RegQueryValueExW(
             hkey,
             PCWSTR(wide_name.as_ptr()),
             None,
             Some(&mut vtype),
             Some(data.as_mut_ptr() as _),
             Some(&mut data_size),
-        );
+        )
+    };
+    if result == ERROR_MORE_DATA && data_size > 0 && data_size <= 131_072 {
+        data.resize((data_size as usize).div_ceil(2), 0);
+        data_size = (data.len() * 2) as u32;
+        result = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(wide_name.as_ptr()),
+                None,
+                Some(&mut vtype),
+                Some(data.as_mut_ptr() as _),
+                Some(&mut data_size),
+            )
+        };
+    }
+    unsafe {
         let _ = RegCloseKey(hkey);
+    }
 
-        if result.is_err() {
-            return None;
-        }
+    if result.is_err() || (vtype != REG_SZ && vtype != REG_EXPAND_SZ) {
+        return None;
+    }
 
-        let len = (data_size / 2).saturating_sub(1) as usize;
-        // App Paths values are sometimes quoted.
-        let path = String::from_utf16_lossy(&data[..len]).trim_matches('"').to_string();
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            Some(path)
-        } else {
-            None
-        }
+    let max_u16 = ((data_size as usize) / 2).min(data.len());
+    let slice = &data[..max_u16];
+    let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    let text = String::from_utf16_lossy(&slice[..len]);
+    if vtype == REG_EXPAND_SZ {
+        expand_env_strings(&text)
+    } else {
+        Some(text)
+    }
+}
+
+fn expand_env_strings(input: &str) -> Option<String> {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+
+    let wide: Vec<u16> = input.encode_utf16().chain([0]).collect();
+    let needed = unsafe { ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), None) };
+    if needed == 0 || needed > 65536 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let written = unsafe { ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), Some(&mut buf)) };
+    if written == 0 || written > needed {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+pub(crate) fn parse_app_paths_value(raw: &str) -> Option<String> {
+    let cleaned = raw.trim().trim_matches('"').trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
     }
 }
 
@@ -218,7 +283,7 @@ fn scan_lnk_dir(dir: &str, exe_name: &str, product_name: &str, depth: u32) -> Op
 
 fn lnk_matches(target: &str, args: &str, exe_name: &str, product_name: &str) -> bool {
     let target_path = std::path::Path::new(target);
-    if !target_path.exists() {
+    if !target_path.is_file() {
         return false;
     }
     let target_file = target_path
@@ -227,15 +292,100 @@ fn lnk_matches(target: &str, args: &str, exe_name: &str, product_name: &str) -> 
         .unwrap_or_default();
 
     if target_file == exe_name {
-        let actual = crate::discovery::read_product_name(target)
-            .unwrap_or_else(|| crate::discovery::exe_stem(target));
-        return crate::discovery::product_name_matches(&actual, product_name);
+        return crate::discovery::exe_matches_win32_identity(target, exe_name, product_name);
     }
 
-    // Launcher stub: the real EXE is named in the arguments.
-    args.to_lowercase()
+    if target_file == "update.exe" {
+        let Some(proc_exe) = crate::installed::parse_process_start(args) else {
+            return false;
+        };
+        if !proc_exe.eq_ignore_ascii_case(exe_name) {
+            return false;
+        }
+        let Some(update_dir) = target_path.parent() else {
+            return false;
+        };
+        let Some(squirrel_exe) = crate::installed::resolve_squirrel_exe(update_dir, &proc_exe)
+        else {
+            return false;
+        };
+        return crate::discovery::exe_matches_win32_identity(
+            &squirrel_exe,
+            exe_name,
+            product_name,
+        );
+    }
+
+    // Other launcher stub: require `exe_name` in arguments and verify product identity.
+    let has_exe_token = args
+        .to_lowercase()
         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '/'))
-        .any(|tok| tok == exe_name)
+        .any(|tok| tok == exe_name);
+    if !has_exe_token {
+        return false;
+    }
+    if target
+        .to_lowercase()
+        .starts_with(&crate::discovery::windows_dir())
+    {
+        return false;
+    }
+
+    let arg_file_match = split_arg_tokens(args).into_iter().any(|tok| {
+        std::path::Path::new(&tok)
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(exe_name))
+            && crate::discovery::exe_matches_win32_identity(&tok, exe_name, product_name)
+    });
+    if arg_file_match {
+        return true;
+    }
+    if let Some(sibling) = target_path.parent().map(|d| d.join(exe_name)) {
+        if let Some(s) = sibling.to_str() {
+            if crate::discovery::exe_matches_win32_identity(s, exe_name, product_name) {
+                return true;
+            }
+        }
+    }
+    crate::discovery::read_product_name(target)
+        .is_some_and(|actual| crate::discovery::product_name_matches(&actual, product_name))
+}
+
+fn split_arg_tokens(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = args.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            for ch in chars.by_ref() {
+                if ch == '"' {
+                    break;
+                }
+                tok.push(ch);
+            }
+            if !tok.is_empty() {
+                out.push(tok);
+            }
+        } else {
+            let mut tok = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                tok.push(ch);
+                chars.next();
+            }
+            if !tok.is_empty() {
+                out.push(tok);
+            }
+        }
+    }
+    out
 }
 
 pub(crate) struct ShortcutInfo {
@@ -316,11 +466,67 @@ pub(crate) fn read_shortcut_info(lnk_path: &str) -> Option<ShortcutInfo> {
     }
 }
 
+/// Resolve the working directory to pass when launching `exe_path` directly.
+///
+/// Preserves the captured working directory unless it pointed at the old
+/// executable's own directory and the launch target moved (e.g. an update).
+pub(crate) fn resolve_launch_working_dir(
+    exe_path: &str,
+    ctx: Option<&LaunchContext>,
+) -> Option<String> {
+    fn norm_dir(p: &std::path::Path) -> String {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    }
+
+    let exe_dir = std::path::Path::new(exe_path)
+        .parent()
+        .filter(|p| p.is_dir());
+
+    if let Some(cwd) = ctx.and_then(|c| c.working_dir.as_deref()) {
+        let cwd_path = std::path::Path::new(cwd);
+        if cwd_path.is_dir() {
+            if let (Some(src_exe), Some(target_dir)) =
+                (ctx.and_then(|c| c.source_exe.as_deref()), exe_dir)
+            {
+                if let Some(src_dir) = std::path::Path::new(src_exe).parent() {
+                    if norm_dir(cwd_path) == norm_dir(src_dir)
+                        && norm_dir(target_dir) != norm_dir(src_dir)
+                    {
+                        return Some(target_dir.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            return Some(cwd.to_string());
+        }
+    }
+
+    exe_dir.map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Actually launch an application given a resolved `LaunchEntry`.
 pub fn launch(entry: &LaunchEntry) -> anyhow::Result<()> {
+    launch_with_context(entry, None)
+}
+
+/// Launch an application given a resolved `LaunchEntry`, applying `ctx`
+/// (original command-line arguments and working directory) for direct EXEs.
+pub fn launch_with_context(
+    entry: &LaunchEntry,
+    ctx: Option<&LaunchContext>,
+) -> anyhow::Result<()> {
     match entry {
         LaunchEntry::Aumid(aumid) => launch_aumid(aumid),
-        LaunchEntry::Shortcut(path) | LaunchEntry::ExePath(path) => launch_exe(path),
+        LaunchEntry::Shortcut(path) => launch_shell_item(path, None, None),
+        LaunchEntry::ExePath(path) => {
+            let args = ctx
+                .and_then(|c| c.args.as_deref())
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            let working_dir = resolve_launch_working_dir(path, ctx);
+            launch_shell_item(path, args, working_dir.as_deref())
+        }
     }
 }
 
@@ -372,17 +578,31 @@ fn launch_aumid_shell(aumid: &str) -> anyhow::Result<()> {
     }
 }
 
-fn launch_exe(path: &str) -> anyhow::Result<()> {
+fn launch_shell_item(
+    path: &str,
+    args: Option<&str>,
+    working_dir: Option<&str>,
+) -> anyhow::Result<()> {
     let wide_path: Vec<u16> = path.encode_utf16().chain([0]).collect();
     let wide_open: Vec<u16> = "open\0".encode_utf16().collect();
+    let wide_args: Option<Vec<u16>> = args
+        .filter(|a| !a.is_empty())
+        .map(|a| a.encode_utf16().chain([0]).collect());
+    let wide_dir: Option<Vec<u16>> = working_dir
+        .filter(|d| !d.is_empty())
+        .map(|d| d.encode_utf16().chain([0]).collect());
 
     unsafe {
         let result = ShellExecuteW(
             None,
             PCWSTR(wide_open.as_ptr()),
             PCWSTR(wide_path.as_ptr()),
-            None,
-            None,
+            wide_args
+                .as_ref()
+                .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+            wide_dir
+                .as_ref()
+                .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
             SW_SHOWNORMAL,
         );
         if result.0 as usize > 32 {
@@ -423,5 +643,82 @@ mod tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn resolve_win32_entry_verifies_product_identity_on_path_hint() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_str = exe.to_string_lossy().into_owned();
+        let exe_name = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+        let product = crate::discovery::read_product_name(&exe_str)
+            .unwrap_or_else(|| crate::discovery::exe_stem(&exe_str));
+
+        // Same exe_name but mismatched product_name must be rejected.
+        assert!(resolve_win32_entry(
+            &exe_name,
+            "Definitely Mismatched Product",
+            Some(&exe_str)
+        )
+        .is_none());
+
+        // Matching exe_name and product_name resolves to ExePath.
+        let entry = resolve_win32_entry(&exe_name, &product, Some(&exe_str));
+        assert!(matches!(entry, Some(LaunchEntry::ExePath(_))));
+    }
+
+    #[test]
+    fn parse_app_paths_value_cases() {
+        assert_eq!(
+            parse_app_paths_value(r#"  "C:\Program Files\App\app.exe"  "#),
+            Some(r"C:\Program Files\App\app.exe".to_string())
+        );
+        assert_eq!(
+            parse_app_paths_value(r"C:\Tools\tool.exe"),
+            Some(r"C:\Tools\tool.exe".to_string())
+        );
+        assert_eq!(parse_app_paths_value("  \"\"  "), None);
+    }
+
+    #[test]
+    fn resolve_launch_working_dir_cases() {
+        let temp_dir = std::env::temp_dir();
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_str = exe.to_string_lossy().into_owned();
+        let exe_dir = exe.parent().unwrap().to_string_lossy().into_owned();
+        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let sys32 = format!(r"{sys_root}\System32");
+
+        // Preserves custom user working directory.
+        let ctx_user_cwd = LaunchContext {
+            args: Some("--flag".to_string()),
+            working_dir: Some(temp_dir.to_string_lossy().into_owned()),
+            source_exe: Some(exe_str.clone()),
+        };
+        assert_eq!(
+            resolve_launch_working_dir(&exe_str, Some(&ctx_user_cwd)),
+            Some(temp_dir.to_string_lossy().into_owned())
+        );
+
+        // If old CWD equaled old install dir and target EXE moved, use new EXE's dir.
+        let ctx_old_install_cwd = LaunchContext {
+            args: None,
+            working_dir: Some(sys32.clone()),
+            source_exe: Some(format!(r"{sys32}\old_app.exe")),
+        };
+        assert_eq!(
+            resolve_launch_working_dir(&exe_str, Some(&ctx_old_install_cwd)),
+            Some(exe_dir.clone())
+        );
+
+        // Missing/invalid CWD falls back to target EXE's parent directory.
+        let ctx_bad_cwd = LaunchContext {
+            args: None,
+            working_dir: Some(r"C:\NonExistent\Dir_12345".to_string()),
+            source_exe: None,
+        };
+        assert_eq!(
+            resolve_launch_working_dir(&exe_str, Some(&ctx_bad_cwd)),
+            Some(exe_dir)
+        );
     }
 }

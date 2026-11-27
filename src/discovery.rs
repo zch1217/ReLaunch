@@ -3,15 +3,16 @@ use std::collections::{HashMap, HashSet};
 use windows::{
     core::PWSTR,
     Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM},
+        Foundation::{CloseHandle, BOOL, FILETIME, HANDLE, HWND, LPARAM, WPARAM},
         Storage::Packaging::Appx::GetApplicationUserModelId,
         System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-            PROCESS_QUERY_LIMITED_INFORMATION,
+            GetProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
         },
         UI::WindowsAndMessaging::{
             EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId,
-            IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+            IsWindowVisible, SendMessageTimeoutW, GWL_EXSTYLE, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+            WM_NULL, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -19,9 +20,9 @@ use windows::{
 /// Discovers currently running desktop applications by enumerating visible windows.
 ///
 /// Grouping rules:
-/// - Packaged (MSIX) apps are grouped by AUMID. All processes of the same package
-///   family in the current session belong to the app, even with different EXE
-///   names (Codex: codex.exe, codex-code-mode-host.exe, ...).
+/// - Packaged (MSIX) apps are grouped by AUMID. Helper processes without an explicit
+///   AUMID are attached only when their process ancestry traces back to an explicit
+///   AUMID ancestor (checked for PID reuse via creation times).
 /// - Win32 apps are grouped by full EXE path. All processes with the same path in
 ///   the current session belong to the app (Electron / Chrome child processes).
 ///
@@ -169,7 +170,8 @@ pub fn current_app(identity: &AppIdentity) -> Option<AppInfo> {
 /// Find a running app by identity alone, without requiring a visible window.
 /// Used for favorites that live in the system tray (WeChat, Feishu, CC Switch...).
 ///
-/// - MSIX: every process of the same package family.
+/// - MSIX: processes matching the target AUMID explicitly, plus unlabeled helper
+///   processes whose verified ancestor chain leads to that AUMID.
 /// - Win32: every process whose file name equals `exe_name` and whose
 ///   ProductName (when present) agrees with `product_name`.
 ///
@@ -203,7 +205,33 @@ pub fn find_by_identity(identity: &AppIdentity) -> Option<AppInfo> {
                 family,
             });
         }
-        let pids = select_msix_pids_for_aumid(aumid, &procs, &parent_map);
+        let mut creation_times = HashMap::new();
+        if procs.iter().any(|p| p.aumid.is_none()) {
+            for p in &procs {
+                if let Some(ct) = query_process_creation_time(p.pid) {
+                    creation_times.insert(p.pid, ct);
+                }
+            }
+            for p in procs.iter().filter(|p| p.aumid.is_none()) {
+                let mut cur = p.pid;
+                let mut visited = HashSet::new();
+                for _ in 0..64 {
+                    let Some(&ppid) = parent_map.get(&cur) else {
+                        break;
+                    };
+                    if ppid == 0 || ppid == cur || !visited.insert(ppid) {
+                        break;
+                    }
+                    if !creation_times.contains_key(&ppid) {
+                        if let Some(ct) = query_process_creation_time(ppid) {
+                            creation_times.insert(ppid, ct);
+                        }
+                    }
+                    cur = ppid;
+                }
+            }
+        }
+        let pids = select_msix_pids_for_aumid(aumid, &procs, &parent_map, &creation_times);
         if pids.is_empty() {
             return None;
         }
@@ -327,25 +355,120 @@ fn normalize_product_name(s: &str) -> String {
     trimmed.to_lowercase()
 }
 
+/// Verify that an on-disk executable matches the canonical Win32 `AppIdentity`.
+pub(crate) fn exe_matches_win32_identity(
+    exe_path: &str,
+    exe_name: &str,
+    product_name: &str,
+) -> bool {
+    let path = std::path::Path::new(exe_path);
+    if !path.is_file() {
+        return false;
+    }
+    if exe_path.to_lowercase().starts_with(&windows_dir()) {
+        return false;
+    }
+    let file_ok = path
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(exe_name));
+    if !file_ok {
+        return false;
+    }
+    let actual = read_product_name(exe_path).unwrap_or_else(|| exe_stem(exe_path));
+    product_name_matches(&actual, product_name)
+}
+
 /// Verify an already-open process handle against `identity` before terminating,
 /// preventing accidental termination when a PID is reused between discovery and kill.
-pub(crate) fn handle_matches_identity(handle: HANDLE, identity: &AppIdentity) -> bool {
+///
+/// Reuses an optional pre-captured `parent_map` and already-opened sibling handles
+/// (`open_handles`) when walking MSIX helper ancestry.
+pub(crate) fn verify_handle_matches_identity(
+    handle: HANDLE,
+    identity: &AppIdentity,
+    parent_map: Option<&HashMap<u32, u32>>,
+    open_handles: &HashMap<u32, HANDLE>,
+) -> bool {
     match identity {
         AppIdentity::Msix { aumid } => {
             if let Some(proc_aumid) = query_aumid_handle(handle) {
                 return proc_aumid.eq_ignore_ascii_case(aumid);
             }
-            let target_family = aumid.split('!').next().unwrap_or(aumid);
-            if let Some(path) = query_exe_path_handle(handle) {
-                if let Some(path_aumid) = aumid_from_windowsapps_exe(&path) {
-                    return path_aumid.eq_ignore_ascii_case(aumid);
-                }
-                return query_package_family_handle(handle)
-                    .or_else(|| package_family_from_exe_path(&path))
-                    .is_some_and(|f| f.eq_ignore_ascii_case(target_family));
+            let path = query_exe_path_handle(handle);
+            if let Some(path_aumid) = path.as_deref().and_then(aumid_from_windowsapps_exe) {
+                return path_aumid.eq_ignore_ascii_case(aumid);
             }
-            query_package_family_handle(handle)
-                .is_some_and(|f| f.eq_ignore_ascii_case(target_family))
+            let target_family = aumid.split('!').next().unwrap_or(aumid);
+            let in_family = query_package_family_handle(handle)
+                .or_else(|| path.as_deref().and_then(package_family_from_exe_path))
+                .is_some_and(|f| f.eq_ignore_ascii_case(target_family));
+            if !in_family {
+                return false;
+            }
+
+            let pid = unsafe { GetProcessId(handle) };
+            let Some(mut cur_ctime) = query_process_creation_time_handle(handle) else {
+                return false;
+            };
+            if pid == 0 {
+                return false;
+            }
+            let owned_parent_map;
+            let pmap = match parent_map {
+                Some(m) => m,
+                None => {
+                    owned_parent_map = snapshot_processes().into_iter().collect();
+                    &owned_parent_map
+                }
+            };
+
+            let mut cur = pid;
+            let mut visited = HashSet::new();
+            for _ in 0..64 {
+                let Some(&ppid) = pmap.get(&cur) else {
+                    break;
+                };
+                if ppid == 0 || ppid == cur || !visited.insert(ppid) {
+                    break;
+                }
+                let (anc_handle, owned) = if let Some(&h) = open_handles.get(&ppid) {
+                    (h, false)
+                } else {
+                    let Ok(h) =
+                        (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, ppid) })
+                    else {
+                        break;
+                    };
+                    (h, true)
+                };
+                let anc_info = (|| -> Option<(u64, Option<String>)> {
+                    let anc_ctime = query_process_creation_time_handle(anc_handle)?;
+                    if anc_ctime > cur_ctime {
+                        return None;
+                    }
+                    let anc_aumid = query_aumid_handle(anc_handle).or_else(|| {
+                        query_exe_path_handle(anc_handle)
+                            .and_then(|p| aumid_from_windowsapps_exe(&p))
+                    });
+                    Some((anc_ctime, anc_aumid))
+                })();
+                if owned {
+                    unsafe {
+                        let _ = CloseHandle(anc_handle);
+                    }
+                }
+                match anc_info {
+                    None => break,
+                    Some((_, Some(anc_aumid))) => {
+                        return anc_aumid.eq_ignore_ascii_case(aumid);
+                    }
+                    Some((anc_ctime, None)) => {
+                        cur = ppid;
+                        cur_ctime = anc_ctime;
+                    }
+                }
+            }
+            false
         }
         AppIdentity::Win32 {
             exe_name,
@@ -386,6 +509,7 @@ fn resolve_msix_group_key(
     }
     let fam_lower = family.to_lowercase();
     let keys = family_to_keys.get(&fam_lower)?;
+    let mut cur_ctime = query_process_creation_time(pid)?;
 
     let mut cur = pid;
     let mut visited = HashSet::new();
@@ -394,6 +518,12 @@ fn resolve_msix_group_key(
             break;
         };
         if ppid == 0 || ppid == cur || !visited.insert(ppid) {
+            break;
+        }
+        let Some(anc_ctime) = query_process_creation_time(ppid) else {
+            break;
+        };
+        if anc_ctime > cur_ctime {
             break;
         }
         if let Some(anc_key) = pid_to_key.get(&ppid) {
@@ -408,15 +538,13 @@ fn resolve_msix_group_key(
             if anc_fam.eq_ignore_ascii_case(family) {
                 return aumid_to_key.get(&anc_aumid.to_lowercase()).cloned();
             }
+            return None;
         }
         cur = ppid;
+        cur_ctime = anc_ctime;
     }
 
-    if keys.len() == 1 {
-        Some(keys[0].clone())
-    } else {
-        None
-    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +558,7 @@ pub(crate) fn select_msix_pids_for_aumid(
     target_aumid: &str,
     procs: &[MsixProcInfo],
     parent_map: &HashMap<u32, u32>,
+    creation_times: &HashMap<u32, u64>,
 ) -> Vec<u32> {
     let target_family = target_aumid.split('!').next().unwrap_or(target_aumid);
     let mut direct = HashSet::new();
@@ -465,6 +594,13 @@ pub(crate) fn select_msix_pids_for_aumid(
             if ppid == 0 || ppid == cur || !visited.insert(ppid) {
                 break;
             }
+            if let (Some(&cur_ct), Some(&par_ct)) =
+                (creation_times.get(&cur), creation_times.get(&ppid))
+            {
+                if par_ct > cur_ct {
+                    break;
+                }
+            }
             if direct.contains(&ppid) {
                 resolved = Some(true);
                 break;
@@ -475,7 +611,7 @@ pub(crate) fn select_msix_pids_for_aumid(
             }
             cur = ppid;
         }
-        if resolved.unwrap_or_else(|| sibling.is_empty()) {
+        if resolved == Some(true) {
             selected.push(pid);
         }
     }
@@ -493,7 +629,7 @@ fn package_short_name(aumid: &str) -> String {
 }
 
 /// All (pid, parent_pid) pairs currently on the system.
-fn snapshot_processes() -> Vec<(u32, u32)> {
+pub(crate) fn snapshot_processes() -> Vec<(u32, u32)> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -567,7 +703,7 @@ fn query_package_family_handle(handle: HANDLE) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Returns the set of unique PIDs that own visible, meaningful desktop windows.
-fn enumerate_desktop_windows() -> Vec<u32> {
+pub(crate) fn enumerate_desktop_windows() -> Vec<u32> {
     let mut pids: Vec<u32> = Vec::new();
 
     unsafe {
@@ -695,8 +831,8 @@ pub fn read_product_name(exe_path: &str) -> Option<String> {
             return None;
         }
 
-        // Query the language-neutral translation block first, then fall back to 040904B0 (English/Unicode).
-        for lang_cp in [query_first_translation(&buf).unwrap_or(0x040904B0_u32)] {
+        // Query all translation blocks in order, then fall back to common Unicode blocks.
+        for lang_cp in query_translations(&buf) {
             let lang = (lang_cp >> 16) as u16;
             let cp   = (lang_cp & 0xFFFF) as u16;
             let subblock: Vec<u16> = format!("\\StringFileInfo\\{lang:04X}{cp:04X}\\ProductName\0")
@@ -727,11 +863,13 @@ pub fn read_product_name(exe_path: &str) -> Option<String> {
     }
 }
 
-/// Extract the first language+codepage value from \VarFileInfo\Translation.
-unsafe fn query_first_translation(buf: &[u8]) -> Option<u32> {
+/// Extract all `(language << 16 | codepage)` pairs from `\VarFileInfo\Translation`,
+/// appending common Unicode fallbacks if absent.
+unsafe fn query_translations(buf: &[u8]) -> Vec<u32> {
     use windows::Win32::Storage::FileSystem::VerQueryValueW;
     use windows::core::PCWSTR;
 
+    let mut out = Vec::new();
     let subblock: Vec<u16> = "\\VarFileInfo\\Translation\0".encode_utf16().collect();
     let mut pval: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut vlen: u32 = 0;
@@ -745,15 +883,195 @@ unsafe fn query_first_translation(buf: &[u8]) -> Option<u32> {
         && vlen >= 4
         && !pval.is_null()
     {
-        // Translation entries are pairs of u16 (language, codepage).
-        let pair = *(pval as *const u32);
-        // Swap: LOWORD is language, HIWORD is codepage — compose as (lang << 16 | cp).
-        let lang = (pair & 0xFFFF) as u32;
-        let cp   = (pair >> 16) as u32;
-        Some((lang << 16) | cp)
-    } else {
-        None
+        let count = (vlen as usize) / 4;
+        let pairs = std::slice::from_raw_parts(pval as *const u32, count);
+        for &pair in pairs {
+            let lang = pair & 0xFFFF;
+            let cp = pair >> 16;
+            let combined = (lang << 16) | cp;
+            if !out.contains(&combined) {
+                out.push(combined);
+            }
+        }
     }
+    for fallback in [0x0409_04B0_u32, 0x0000_04B0_u32] {
+        if !out.contains(&fallback) {
+            out.push(fallback);
+        }
+    }
+    out
+}
+
+/// Process creation time in 100-ns intervals since 1601-01-01, or None if unreadable.
+pub(crate) fn query_process_creation_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let ctime = query_process_creation_time_handle(handle);
+        let _ = CloseHandle(handle);
+        ctime
+    }
+}
+
+pub(crate) fn query_process_creation_time_handle(handle: HANDLE) -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).ok()?;
+    }
+    Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+}
+
+/// Return true if any PID in `pids` owns a visible, titled, non-tool desktop window
+/// that responds to a synchronous `WM_NULL` probe within 500 ms.
+pub(crate) fn has_responsive_visible_window(pids: &[u32]) -> bool {
+    let hwnds = collect_windows_for_pids(pids, true);
+    any_window_responsive(&hwnds)
+}
+
+/// Return true if any PID in `pids` owns any top-level window (including hidden/tray)
+/// that responds to a synchronous `WM_NULL` probe within 500 ms.
+pub(crate) fn has_responsive_any_window(pids: &[u32]) -> bool {
+    let hwnds = collect_windows_for_pids(pids, false);
+    any_window_responsive(&hwnds)
+}
+
+fn collect_windows_for_pids(pids: &[u32], visible_desktop_only: bool) -> Vec<HWND> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    struct Search<'a> {
+        pids: &'a [u32],
+        visible_desktop_only: bool,
+        hwnds: Vec<HWND>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut Search<'_>);
+        if search.visible_desktop_only {
+            if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+                return BOOL(1);
+            }
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+                return BOOL(1);
+            }
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 && search.pids.contains(&pid) {
+            search.hwnds.push(hwnd);
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search {
+        pids,
+        visible_desktop_only,
+        hwnds: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut search as *mut Search<'_> as isize));
+    }
+    search.hwnds
+}
+
+fn any_window_responsive(hwnds: &[HWND]) -> bool {
+    for &hwnd in hwnds {
+        let mut res: usize = 0;
+        let ok = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                500,
+                Some(&mut res),
+            )
+        };
+        if ok.0 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse the PE header on disk to determine whether `exe_path` targets the
+/// Windows GUI subsystem (`IMAGE_SUBSYSTEM_WINDOWS_GUI == 2`).
+pub(crate) fn is_gui_subsystem(exe_path: &str) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(exe_path).ok()?;
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos).ok()?;
+    if &dos[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]);
+    if e_lfanew < 64 {
+        return None;
+    }
+
+    file.seek(SeekFrom::Start(e_lfanew as u64)).ok()?;
+    // 4 (PE\0\0) + 20 (COFF) + 72 (Optional Header through Subsystem at offset 68..70)
+    let mut pe = [0u8; 96];
+    file.read_exact(&mut pe).ok()?;
+    if &pe[0..4] != b"PE\0\0" {
+        return None;
+    }
+    let magic = u16::from_le_bytes([pe[24], pe[25]]);
+    if magic != 0x10B && magic != 0x20B {
+        return None;
+    }
+    let subsystem = u16::from_le_bytes([pe[92], pe[93]]);
+    Some(subsystem == 2)
+}
+
+/// Choose root PIDs from `pids`, preferring visible-desktop-window owners and
+/// earliest creation times.
+pub(crate) fn select_root_pids(pids: &[u32]) -> Vec<u32> {
+    let mut unique = Vec::new();
+    let mut pid_set = HashSet::new();
+    for &pid in pids {
+        if pid != 0 && pid_set.insert(pid) {
+            unique.push(pid);
+        }
+    }
+    if unique.is_empty() {
+        return Vec::new();
+    }
+
+    let parent_map: HashMap<u32, u32> = snapshot_processes().into_iter().collect();
+    let mut roots: Vec<u32> = unique
+        .iter()
+        .copied()
+        .filter(|&pid| match parent_map.get(&pid) {
+            Some(&ppid) if ppid != pid && pid_set.contains(&ppid) => {
+                match (
+                    query_process_creation_time(ppid),
+                    query_process_creation_time(pid),
+                ) {
+                    (Some(par_ct), Some(child_ct)) => par_ct > child_ct,
+                    _ => false,
+                }
+            }
+            _ => true,
+        })
+        .collect();
+    if roots.is_empty() {
+        roots = unique;
+    }
+
+    let desktop_pids: HashSet<u32> = enumerate_desktop_windows().into_iter().collect();
+    roots.sort_by_key(|&pid| {
+        (
+            !desktop_pids.contains(&pid),
+            query_process_creation_time(pid).unwrap_or(u64::MAX),
+            pid,
+        )
+    });
+    roots
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,7 +1404,8 @@ mod tests {
     #[test]
     fn select_msix_pids_multi_app_package() {
         let family = "Suite_abc".to_string();
-        // Single-app package: unlabeled helper without labeled ancestor still belongs.
+        // Single-app package: unlabeled helper IS selected when ancestor traces to direct,
+        // NOT selected when no labeled ancestor exists (no package-family fallback).
         let single_procs = vec![
             MsixProcInfo {
                 pid: 100,
@@ -1098,13 +1417,42 @@ mod tests {
                 aumid: None,
                 family: family.clone(),
             },
+            MsixProcInfo {
+                pid: 102,
+                aumid: None,
+                family: family.clone(),
+            },
         ];
+        let mut single_parents = HashMap::new();
+        single_parents.insert(101, 100);
+        single_parents.insert(102, 1); // no labeled ancestor
         assert_eq!(
-            select_msix_pids_for_aumid("Suite_abc!App1", &single_procs, &HashMap::new()),
+            select_msix_pids_for_aumid(
+                "Suite_abc!App1",
+                &single_procs,
+                &single_parents,
+                &HashMap::new()
+            ),
             vec![100, 101]
         );
 
-        // Multi-app package: App1 and App2 run together, each with unlabeled helpers.
+        // Unlabeled helpers alone (no direct AUMID) must return empty.
+        let unlabeled_only = vec![MsixProcInfo {
+            pid: 200,
+            aumid: None,
+            family: family.clone(),
+        }];
+        assert_eq!(
+            select_msix_pids_for_aumid(
+                "Suite_abc!App1",
+                &unlabeled_only,
+                &HashMap::new(),
+                &HashMap::new()
+            ),
+            Vec::<u32>::new()
+        );
+
+        // Multi-app package: multi-hop ancestry, orphan exclusion, and PID-reuse creation time guard.
         let multi_procs = vec![
             MsixProcInfo {
                 pid: 10,
@@ -1113,6 +1461,11 @@ mod tests {
             },
             MsixProcInfo {
                 pid: 11,
+                aumid: None,
+                family: family.clone(),
+            },
+            MsixProcInfo {
+                pid: 12,
                 aumid: None,
                 family: family.clone(),
             },
@@ -1129,21 +1482,84 @@ mod tests {
             MsixProcInfo {
                 pid: 30,
                 aumid: None,
+                family: family.clone(),
+            },
+            MsixProcInfo {
+                pid: 40,
+                aumid: None,
                 family,
             },
         ];
         let mut parents = HashMap::new();
         parents.insert(11, 10);
+        parents.insert(12, 11); // multi-hop: 12 -> 11 -> 10
         parents.insert(21, 20);
         parents.insert(30, 1); // unrelated orphan
+        parents.insert(40, 10); // claims parent 10, but creation time shows PID reuse
+
+        let mut ctimes = HashMap::new();
+        ctimes.insert(10, 500);
+        ctimes.insert(11, 510);
+        ctimes.insert(12, 520);
+        ctimes.insert(40, 400); // older than parent 10 -> PID 10 was reused
 
         assert_eq!(
-            select_msix_pids_for_aumid("Suite_abc!App1", &multi_procs, &parents),
-            vec![10, 11]
+            select_msix_pids_for_aumid("Suite_abc!App1", &multi_procs, &parents, &ctimes),
+            vec![10, 11, 12]
         );
         assert_eq!(
-            select_msix_pids_for_aumid("Suite_abc!App2", &multi_procs, &parents),
+            select_msix_pids_for_aumid("Suite_abc!App2", &multi_procs, &parents, &ctimes),
             vec![20, 21]
         );
+    }
+
+    #[test]
+    fn exe_matches_win32_identity_cases() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_str = exe.to_string_lossy();
+        let exe_name = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+        let product = read_product_name(&exe_str).unwrap_or_else(|| exe_stem(&exe_str));
+
+        assert!(exe_matches_win32_identity(&exe_str, &exe_name, &product));
+        assert!(!exe_matches_win32_identity(
+            &exe_str,
+            &exe_name,
+            "Definitely Wrong Product Name"
+        ));
+        assert!(!exe_matches_win32_identity(
+            &exe_str,
+            "other_name.exe",
+            &product
+        ));
+
+        let dir_str = exe.parent().unwrap().to_string_lossy();
+        assert!(!exe_matches_win32_identity(&dir_str, &exe_name, &product));
+        assert!(!exe_matches_win32_identity(
+            r"C:\NonExistent\missing_app.exe",
+            "missing_app.exe",
+            "Missing App"
+        ));
+
+        let cmd = std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        if std::path::Path::new(&cmd).is_file() {
+            let cmd_product = read_product_name(&cmd).unwrap_or_else(|| "cmd".into());
+            assert!(!exe_matches_win32_identity(&cmd, "cmd.exe", &cmd_product));
+        }
+    }
+
+    #[test]
+    fn is_gui_subsystem_detects_console_and_gui() {
+        let cmd = std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        assert_eq!(is_gui_subsystem(&cmd), Some(false));
+
+        let explorer = format!(
+            "{}\\explorer.exe",
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
+        );
+        if std::path::Path::new(&explorer).is_file() {
+            assert_eq!(is_gui_subsystem(&explorer), Some(true));
+        }
+
+        assert_eq!(is_gui_subsystem(r"C:\NonExistent\missing.exe"), None);
     }
 }

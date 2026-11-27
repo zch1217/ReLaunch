@@ -484,6 +484,14 @@ fn describe_outcome(name: &str, result: &Result<Done, RestartError>) -> StatusMe
             text: format!("已发出启动指令，但 10 秒内没有检测到 {name} 的新进程"),
             kind: StatusKind::Error,
         },
+        Err(RestartError::ExitedEarly) => StatusMessage {
+            text: format!("已启动 {name}，但新进程在完成初始化前退出"),
+            kind: StatusKind::Error,
+        },
+        Err(RestartError::InitTimeout) => StatusMessage {
+            text: format!("已检测到 {name} 的新进程，但超时内未完成初始化"),
+            kind: StatusKind::Error,
+        },
         Err(RestartError::LaunchFailed(e)) => StatusMessage {
             text: format!("启动 {name} 失败: {e}"),
             kind: StatusKind::Error,
