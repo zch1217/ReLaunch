@@ -76,6 +76,7 @@ mod tests {
     /// Writes target/icon_preview_{32,256}.png for visual inspection.
     #[test]
     fn preview() {
+        let _ = std::fs::create_dir_all("target");
         for size in [32u32, 256] {
             let img = image::RgbaImage::from_raw(size, size, super::rgba(size)).unwrap();
             img.save(format!("target/icon_preview_{size}.png")).unwrap();

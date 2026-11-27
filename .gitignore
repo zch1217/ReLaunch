@@ -1,5 +1,6 @@
 # Build output
 /target/
+/dist/
 
 # User config and test files
 /target/testtools/

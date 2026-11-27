@@ -17,6 +17,8 @@ pub struct FavoriteEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub favorites: Vec<FavoriteEntry>,
+    #[serde(default)]
+    pub dark_mode: bool,
 }
 
 impl Config {
@@ -60,5 +62,54 @@ impl Config {
 
     pub fn is_favorite(&self, identity: &AppIdentity) -> bool {
         self.favorites.iter().any(|f| &f.identity == identity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn favorites_add_dedup_remove_and_json_roundtrip() {
+        let mut cfg = Config::default();
+        let msix = AppIdentity::Msix {
+            aumid: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
+        };
+        let win32 = AppIdentity::Win32 {
+            exe_name: "code.exe".to_string(),
+            product_name: "Visual Studio Code".to_string(),
+        };
+
+        cfg.add_favorite(FavoriteEntry {
+            display_name: "Codex".to_string(),
+            identity: msix.clone(),
+            last_known_path: None,
+        });
+        cfg.add_favorite(FavoriteEntry {
+            display_name: "Codex Duplicate".to_string(),
+            identity: msix.clone(),
+            last_known_path: Some(r"C:\Dummy\codex.exe".to_string()),
+        });
+        cfg.add_favorite(FavoriteEntry {
+            display_name: "VS Code".to_string(),
+            identity: win32.clone(),
+            last_known_path: Some(r"C:\Program Files\Microsoft VS Code\Code.exe".to_string()),
+        });
+        cfg.dark_mode = true;
+
+        assert_eq!(cfg.favorites.len(), 2);
+        assert!(cfg.is_favorite(&msix));
+        assert!(cfg.is_favorite(&win32));
+
+        let json = serde_json::to_string_pretty(&cfg).expect("serialize config");
+        let parsed: Config = serde_json::from_str(&json).expect("deserialize config");
+        assert!(parsed.dark_mode);
+        assert_eq!(parsed.favorites.len(), 2);
+        assert_eq!(parsed.favorites[0].display_name, "Codex");
+        assert_eq!(parsed.favorites[1].identity, win32);
+
+        cfg.remove_favorite(&msix);
+        assert!(!cfg.is_favorite(&msix));
+        assert_eq!(cfg.favorites.len(), 1);
     }
 }

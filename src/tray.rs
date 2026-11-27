@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -23,6 +23,7 @@ use crate::identity::{AppIdentity, AppInfo};
 #[derive(Clone)]
 enum TrayAction {
     OpenMainWindow,
+    ToggleAutostart,
     Exit,
     /// Restart if running, start if not — decided when the job executes.
     Run(AppIdentity),
@@ -33,8 +34,10 @@ struct TrayUi {
     icon: TrayIcon,
     /// One menu item per favorite, so labels can be updated in place.
     app_items: Vec<(MenuItem, AppIdentity)>,
-    /// Favorites the current menu was built for; a change means rebuild.
-    built_for: Vec<AppIdentity>,
+    /// Auto-start checkbox item, synced with AppState::autostart.
+    autostart_item: Option<CheckMenuItem>,
+    /// Favorites the current menu was built for; None = menu not built yet.
+    built_for: Option<Vec<AppIdentity>>,
     last_refresh: Option<Instant>,
 }
 
@@ -66,17 +69,32 @@ pub fn install(
         *t.borrow_mut() = Some(TrayUi {
             icon: tray,
             app_items: Vec::new(),
-            built_for: Vec::new(),
+            autostart_item: None,
+            built_for: None,
             last_refresh: None,
         })
     });
-    sync_menu(&state.lock().unwrap().favorite_apps());
+    let (favorites, autostart) = {
+        let s = state.lock().unwrap();
+        (s.favorite_apps(), s.autostart)
+    };
+    sync_menu(&favorites, autostart);
 
     let (menu_state, menu_ctx) = (state.clone(), ctx.clone());
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let action = actions().lock().unwrap().get(&event.id.0).cloned();
         match action {
             Some(TrayAction::OpenMainWindow) => show_main_window(hwnd, &menu_ctx),
+            Some(TrayAction::ToggleAutostart) => {
+                let actual = {
+                    let mut s = menu_state.lock().unwrap();
+                    let target = !s.autostart;
+                    s.set_autostart(target);
+                    s.autostart
+                };
+                sync_autostart(actual);
+                menu_ctx.request_repaint();
+            }
             Some(TrayAction::Exit) => exit_app(),
             Some(TrayAction::Run(identity)) => begin_operation(&menu_state, &menu_ctx, &identity),
             None => {}
@@ -97,32 +115,47 @@ pub fn install(
     Ok(())
 }
 
-/// Bring the menu in line with `favorites`: rebuild if the set of favorites
-/// changed, otherwise just update the 重启/启动 labels in place.
+/// Bring the menu in line with `favorites` and `autostart`: rebuild if the set
+/// of favorites changed, otherwise just update labels and checkbox in place.
 /// Main thread only; a no-op if the tray was not installed.
-pub fn sync_menu(favorites: &[AppInfo]) {
+pub fn sync_menu(favorites: &[AppInfo], autostart: bool) {
     TRAY.with(|t| {
         let mut guard = t.borrow_mut();
         let Some(tray) = guard.as_mut() else { return };
         let ids: Vec<AppIdentity> = favorites.iter().map(|a| a.identity.clone()).collect();
-        if ids == tray.built_for {
+        if tray.built_for.as_ref() == Some(&ids) {
             for (item, identity) in &tray.app_items {
                 if let Some(app) = favorites.iter().find(|a| &a.identity == identity) {
                     item.set_text(label_for(app));
                 }
             }
+            if let Some(item) = &tray.autostart_item {
+                item.set_checked(autostart);
+            }
         } else {
-            rebuild(tray, favorites);
-            tray.built_for = ids;
+            rebuild(tray, favorites, autostart);
+            tray.built_for = Some(ids);
         }
     });
 }
 
-fn rebuild(tray: &mut TrayUi, favorites: &[AppInfo]) {
+/// Update only the auto-start checkbox in the tray menu. Main thread only.
+pub fn sync_autostart(enabled: bool) {
+    TRAY.with(|t| {
+        if let Some(tray) = t.borrow().as_ref() {
+            if let Some(item) = &tray.autostart_item {
+                item.set_checked(enabled);
+            }
+        }
+    });
+}
+
+fn rebuild(tray: &mut TrayUi, favorites: &[AppInfo], autostart: bool) {
     let menu = Menu::new();
     let mut acts = actions().lock().unwrap();
     acts.clear();
     tray.app_items.clear();
+    tray.autostart_item = None;
 
     let _ = menu.append(&MenuItem::new("ReLaunch", false, None));
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -138,6 +171,11 @@ fn rebuild(tray: &mut TrayUi, favorites: &[AppInfo]) {
     }
 
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let auto = CheckMenuItem::new("开机自启", true, autostart, None);
+    acts.insert(auto.id().0.clone(), TrayAction::ToggleAutostart);
+    let _ = menu.append(&auto);
+    tray.autostart_item = Some(auto);
+
     let open = MenuItem::new("打开主界面", true, None);
     acts.insert(open.id().0.clone(), TrayAction::OpenMainWindow);
     let _ = menu.append(&open);

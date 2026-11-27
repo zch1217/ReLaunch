@@ -1,6 +1,6 @@
 use crate::identity::AppIdentity;
-use crate::launcher::{resolve_launch_entry, launch};
-use crate::process::{close_gracefully, CloseResult};
+use crate::launcher::{launch, resolve_launch_entry};
+use crate::process::{terminate_processes, CloseResult};
 
 #[derive(Debug)]
 pub enum RestartError {
@@ -8,6 +8,8 @@ pub enum RestartError {
     NoLaunchEntry,
     /// OS denied access (target likely running elevated).
     AccessDenied,
+    /// Existing processes did not finish exiting within the timeout — launch aborted.
+    CloseTimeout,
     /// Launch failed after close succeeded.
     LaunchFailed(String),
     /// Launch command was accepted, but no new process appeared in time.
@@ -18,34 +20,50 @@ pub enum RestartError {
 
 /// Full restart flow for a single application.
 ///
-/// Invariant: if `NoLaunchEntry` is returned, the original process is untouched.
-pub fn restart(identity: &AppIdentity, pids: &[u32]) -> Result<(), RestartError> {
-    // 1. Re-identify the app; the process list the UI holds may be stale
-    //    (Electron apps spawn and drop helper processes constantly).
+/// Invariants:
+/// - Validate launch entry BEFORE terminating: if `NoLaunchEntry`, the app is untouched.
+/// - Only terminate PIDs freshly discovered for `identity` (never stale caller PIDs).
+/// - Confirm all target processes have exited BEFORE launching the new instance.
+pub fn restart(identity: &AppIdentity, path_hint: Option<&str>) -> Result<(), RestartError> {
+    // 1. Re-discover live processes right before terminating.
     let live = crate::discovery::current_app(identity);
-    let running_exe = live.as_ref().and_then(|a| a.exe_path.clone());
-    let pids: Vec<u32> = match &live {
-        Some(app) if !app.pids.is_empty() => app.pids.clone(),
-        _ => pids.to_vec(),
-    };
+    let hint = live
+        .as_ref()
+        .and_then(|a| a.exe_path.as_deref())
+        .or(path_hint);
 
     // 2. Resolve launch entry BEFORE killing. No entry -> leave the app alone.
-    let entry = resolve_launch_entry(identity, running_exe.as_deref())
-        .ok_or(RestartError::NoLaunchEntry)?;
+    let entry = resolve_launch_entry(identity, hint).ok_or(RestartError::NoLaunchEntry)?;
 
-    // 3. Kill the process tree.
-    match close_gracefully(&pids) {
-        CloseResult::Exited => {}
-        CloseResult::AccessDenied => return Err(RestartError::AccessDenied),
-        CloseResult::Error(e) => return Err(RestartError::Other(e)),
+    // 3. Terminate every live process of the app and confirm full exit.
+    let mut killed_pids = Vec::new();
+    let mut current = live;
+    for _pass in 0..2 {
+        let Some(app) = current.take() else {
+            break;
+        };
+        if app.pids.is_empty() {
+            break;
+        }
+        match terminate_processes(identity, &app.pids) {
+            CloseResult::Exited => {
+                killed_pids.extend(app.pids);
+            }
+            CloseResult::AccessDenied => return Err(RestartError::AccessDenied),
+            CloseResult::Timeout => return Err(RestartError::CloseTimeout),
+            CloseResult::Error(e) => return Err(RestartError::Other(e)),
+        }
+        current = crate::discovery::find_by_identity(identity);
+    }
+    if current.is_some_and(|app| !app.pids.is_empty()) {
+        return Err(RestartError::CloseTimeout);
     }
 
-    // 4. Launch the entry validated in step 2. Not re-resolved: the running-path
-    //    fallback is only meaningful while the process was alive.
+    // 4. Launch the entry validated in step 2.
     launch(&entry).map_err(|e| RestartError::LaunchFailed(e.to_string()))?;
 
     // 5. Confirm a new process actually appeared (not one of the killed PIDs).
-    if wait_for_new_process(identity, &pids) {
+    if wait_for_new_process(identity, &killed_pids) {
         Ok(())
     } else {
         Err(RestartError::NotDetected)
@@ -86,7 +104,7 @@ pub enum Done {
 /// that has since started must still do the right thing.
 pub fn run(identity: &AppIdentity, path_hint: Option<&str>) -> Result<Done, RestartError> {
     if crate::discovery::current_app(identity).is_some() {
-        restart(identity, &[]).map(|_| Done::Restarted)
+        restart(identity, path_hint).map(|_| Done::Restarted)
     } else {
         start(identity, path_hint).map(|_| Done::Started)
     }

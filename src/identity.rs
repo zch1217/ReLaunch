@@ -41,8 +41,8 @@ pub struct AppInfo {
     pub running: bool,
     /// All PIDs belonging to this application's process tree.
     pub pids: Vec<u32>,
-    /// Icon data as RGBA bytes (width × height × 4), 32×32 pixels.
-    pub icon: Option<Vec<u8>>,
+    /// Icon data as RGBA bytes with dimensions.
+    pub icon: Option<crate::icon_extract::IconRgba>,
 }
 
 impl AppInfo {

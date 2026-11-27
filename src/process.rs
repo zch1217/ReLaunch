@@ -1,46 +1,61 @@
-use windows::{
-    Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-                PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-            },
-            Threading::{
-                OpenProcess, TerminateProcess, WaitForMultipleObjects,
-                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-            },
-        },
-        UI::WindowsAndMessaging::{},
+use std::collections::HashSet;
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{
+        OpenProcess, TerminateProcess, WaitForMultipleObjects, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     },
 };
 
-#[derive(Debug)]
+use crate::identity::AppIdentity;
+
+const TERMINATE_WAIT_TIMEOUT_MS: u32 = 5000;
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum CloseResult {
-    /// All processes in the tree exited cleanly.
+    /// All targeted processes exited.
     Exited,
+    /// Timed out waiting for one or more processes to exit after termination.
+    Timeout,
     /// Access denied opening one or more processes (target may be elevated).
     AccessDenied,
     /// Other OS error.
     Error(String),
 }
 
-/// Kill all processes in `pids` immediately via TerminateProcess,
-/// then wait up to 2 seconds for them to exit.
-pub fn close_gracefully(pids: &[u32]) -> CloseResult {
+/// Forcefully terminate all processes belonging to `identity` via `TerminateProcess`
+/// (intentional design for quick restarts of tray/Electron/MSIX apps), verifying
+/// each open process handle against `identity` before terminating to prevent PID-reuse
+/// mis-kills, then wait up to 5 seconds for every verified process to exit.
+pub fn terminate_processes(identity: &AppIdentity, pids: &[u32]) -> CloseResult {
     if pids.is_empty() {
         return CloseResult::Exited;
     }
 
-    // 1. Open handles for terminate + wait.
+    // 1. Open handles for identity check, terminate, and wait.
+    let mut seen = HashSet::new();
     let mut handles: Vec<HANDLE> = Vec::new();
     for &pid in pids {
+        if pid == 0 || is_self(pid) || !seen.insert(pid) {
+            continue;
+        }
         unsafe {
-            match OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) {
-                Ok(h) => handles.push(h),
+            match OpenProcess(
+                PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            ) {
+                Ok(h) => {
+                    if crate::discovery::handle_matches_identity(h, identity) {
+                        handles.push(h);
+                    } else {
+                        tracing::warn!("跳过身份不匹配的 PID {pid}（可能已退出或被复用）");
+                        let _ = CloseHandle(h);
+                    }
+                }
                 Err(e) if e.code() == windows::Win32::Foundation::E_ACCESSDENIED => {
-                    for h in &handles {
-                        let _ = CloseHandle(*h);
+                    for opened in &handles {
+                        let _ = CloseHandle(*opened);
                     }
                     return CloseResult::AccessDenied;
                 }
@@ -50,99 +65,23 @@ pub fn close_gracefully(pids: &[u32]) -> CloseResult {
         }
     }
 
-    // 2. Terminate all.
-    for &h in &handles {
-        unsafe { let _ = TerminateProcess(h, 1); }
+    if handles.is_empty() {
+        return CloseResult::Exited;
     }
 
-    // 3. Wait up to 2 s for all to exit.
-    let result = wait_all(&handles, 2000);
+    // 2. Terminate all verified handles.
+    for &h in &handles {
+        unsafe {
+            let _ = TerminateProcess(h, 1);
+        }
+    }
+
+    // 3. Wait up to 5 s for all to exit.
+    let result = wait_all(&handles, TERMINATE_WAIT_TIMEOUT_MS);
 
     for h in &handles {
-        unsafe { let _ = CloseHandle(*h); }
-    }
-
-    result
-}
-
-/// Force-terminate all processes in `pids` via TerminateProcess.
-/// Only called after explicit user confirmation.
-pub fn force_kill(pids: &[u32]) -> Result<(), String> {
-    let mut last_err: Option<String> = None;
-    for &pid in pids {
         unsafe {
-            match OpenProcess(PROCESS_TERMINATE, false, pid) {
-                Ok(h) => {
-                    if TerminateProcess(h, 1).is_err() {
-                        last_err = Some(format!("TerminateProcess failed for PID {pid}"));
-                    }
-                    let _ = CloseHandle(h);
-                }
-                Err(e) => {
-                    last_err = Some(format!("OpenProcess failed for PID {pid}: {e}"));
-                }
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-/// Returns true if any process in `pids` is still running.
-pub fn is_running(pid: u32) -> bool {
-    unsafe {
-        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            Ok(h) => {
-                use windows::Win32::System::Threading::WaitForSingleObject;
-                let r = WaitForSingleObject(h, 0);
-                let _ = CloseHandle(h);
-                r != WAIT_OBJECT_0
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-/// Collect the full process tree rooted at `root_pid` (root + all descendants).
-pub fn collect_process_tree(root_pid: u32) -> Vec<u32> {
-    let mut result = vec![root_pid];
-    let snapshot = unsafe {
-        match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            Ok(h) => h,
-            Err(_) => return result,
-        }
-    };
-
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-
-    // Gather all (pid, parent_pid) pairs.
-    let mut all: Vec<(u32, u32)> = Vec::new();
-    unsafe {
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                all.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-
-    // BFS to find all descendants.
-    let mut queue = vec![root_pid];
-    while let Some(parent) = queue.pop() {
-        for &(pid, ppid) in &all {
-            if ppid == parent && !result.contains(&pid) {
-                result.push(pid);
-                queue.push(pid);
-            }
+            let _ = CloseHandle(*h);
         }
     }
 
@@ -176,20 +115,96 @@ fn wait_all(handles: &[HANDLE], timeout_ms: u32) -> CloseResult {
                 .unwrap_or_default()
                 .as_millis() as u32;
 
-            let r = unsafe {
-                WaitForMultipleObjects(chunk, true, remaining.min(timeout_ms))
-            };
+            let r = unsafe { WaitForMultipleObjects(chunk, true, remaining.min(timeout_ms)) };
 
             if r == WAIT_OBJECT_0 {
                 break; // All in this chunk exited.
             } else if r == WAIT_TIMEOUT {
-                // Timeout after direct terminate — treat as exited (processes may be
-                // zombie or protected; nothing more to do).
-                break;
+                return CloseResult::Timeout;
             } else {
                 return CloseResult::Error(format!("WaitForMultipleObjects returned {:?}", r));
             }
         }
     }
     CloseResult::Exited
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_pause_cmd() -> ChildGuard {
+        let cmd = std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        let child = Command::new(cmd)
+            .args(["/C", "pause"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn cmd.exe");
+        ChildGuard(child)
+    }
+
+    #[test]
+    fn terminate_processes_empty_and_self_guard() {
+        let self_id = AppIdentity::Manual {
+            path: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+        };
+        assert_eq!(terminate_processes(&self_id, &[]), CloseResult::Exited);
+        assert_eq!(
+            terminate_processes(&self_id, &[std::process::id()]),
+            CloseResult::Exited
+        );
+    }
+
+    #[test]
+    fn terminate_processes_verifies_identity_before_kill() {
+        let mut guard = spawn_pause_cmd();
+        let pid = guard.0.id();
+        let actual_path = crate::discovery::query_exe_path(pid).expect("query cmd.exe path");
+
+        // Mismatched identity must NOT terminate the process.
+        let wrong_id = AppIdentity::Manual {
+            path: r"C:\NonExistent\definitely_not_cmd.exe".to_string(),
+        };
+        assert_eq!(terminate_processes(&wrong_id, &[pid]), CloseResult::Exited);
+        assert!(
+            guard.0.try_wait().unwrap().is_none(),
+            "mismatched identity should not kill live process"
+        );
+
+        // Matching identity must terminate it cleanly.
+        let right_id = AppIdentity::Manual { path: actual_path };
+        assert_eq!(terminate_processes(&right_id, &[pid]), CloseResult::Exited);
+        assert!(
+            guard.0.try_wait().unwrap().is_some(),
+            "matching identity should terminate target process"
+        );
+    }
+
+    #[test]
+    fn wait_all_returns_timeout_for_running_process() {
+        let guard = spawn_pause_cmd();
+        let pid = guard.0.id();
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("OpenProcess");
+        let res = wait_all(&[handle], 50);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        assert_eq!(res, CloseResult::Timeout);
+    }
 }

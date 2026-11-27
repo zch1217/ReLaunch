@@ -38,8 +38,14 @@ impl LaunchEntry {
 /// must NOT close the running application.
 pub fn resolve_launch_entry(identity: &AppIdentity, path_hint: Option<&str>) -> Option<LaunchEntry> {
     match identity {
-        // AUMID is independent of the versioned install directory.
-        AppIdentity::Msix { aumid } => Some(LaunchEntry::Aumid(aumid.clone())),
+        // AUMID is independent of the versioned install directory, but verify it is still registered.
+        AppIdentity::Msix { aumid } => {
+            if is_aumid_registered(aumid) {
+                Some(LaunchEntry::Aumid(aumid.clone()))
+            } else {
+                None
+            }
+        }
         AppIdentity::Win32 { exe_name, product_name } => {
             resolve_win32_entry(exe_name, product_name, path_hint)
         }
@@ -51,6 +57,21 @@ pub fn resolve_launch_entry(identity: &AppIdentity, path_hint: Option<&str>) -> 
             }
         }
     }
+}
+
+/// Verify that an MSIX/Store AUMID is currently registered in `shell:AppsFolder`.
+pub(crate) fn is_aumid_registered(aumid: &str) -> bool {
+    if aumid.is_empty() || !aumid.contains('!') {
+        return false;
+    }
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
+
+    let _com = crate::com::ComGuard::init_sta();
+    let parsing_name = format!("shell:AppsFolder\\{aumid}");
+    let wide: Vec<u16> = parsing_name.encode_utf16().chain([0]).collect();
+    let item: windows::core::Result<IShellItem> =
+        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) };
+    item.is_ok()
 }
 
 fn resolve_win32_entry(exe_name: &str, product_name: &str, path_hint: Option<&str>) -> Option<LaunchEntry> {
@@ -206,13 +227,9 @@ fn lnk_matches(target: &str, args: &str, exe_name: &str, product_name: &str) -> 
         .unwrap_or_default();
 
     if target_file == exe_name {
-        return match crate::discovery::read_product_name(target) {
-            Some(pn) => {
-                let (pn, want) = (pn.to_lowercase(), product_name.to_lowercase());
-                pn.contains(&want) || want.contains(&pn)
-            }
-            None => true,
-        };
+        let actual = crate::discovery::read_product_name(target)
+            .unwrap_or_else(|| crate::discovery::exe_stem(target));
+        return crate::discovery::product_name_matches(&actual, product_name);
     }
 
     // Launcher stub: the real EXE is named in the arguments.
@@ -221,14 +238,22 @@ fn lnk_matches(target: &str, args: &str, exe_name: &str, product_name: &str) -> 
         .any(|tok| tok == exe_name)
 }
 
+pub(crate) struct ShortcutInfo {
+    pub target: String,
+    pub args: String,
+    pub icon_path: Option<String>,
+}
+
 /// Read a .lnk's target path and arguments via IShellLink.
-fn read_shortcut(lnk_path: &str) -> Option<(String, String)> {
+pub(crate) fn read_shortcut(lnk_path: &str) -> Option<(String, String)> {
+    read_shortcut_info(lnk_path).map(|s| (s.target, s.args))
+}
+
+/// Read a .lnk's target path, arguments, and optional custom icon file via IShellLink.
+pub(crate) fn read_shortcut_info(lnk_path: &str) -> Option<ShortcutInfo> {
     use windows::Win32::{
         Storage::FileSystem::WIN32_FIND_DATAW,
-        System::Com::{
-            CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED, STGM_READ,
-        },
+        System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ},
         UI::Shell::{IShellLinkW, ShellLink},
     };
     use windows::core::Interface;
@@ -238,9 +263,8 @@ fn read_shortcut(lnk_path: &str) -> Option<(String, String)> {
         String::from_utf16_lossy(&buf[..len])
     }
 
+    let _com = crate::com::ComGuard::init_sta();
     unsafe {
-        // Harmless if COM is already initialised on this thread.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         let persist: IPersistFile = link.cast().ok()?;
@@ -262,7 +286,33 @@ fn read_shortcut(lnk_path: &str) -> Option<(String, String)> {
         } else {
             String::new()
         };
-        Some((target, args))
+
+        let mut icon_buf = vec![0u16; 1024];
+        let mut icon_index: i32 = 0;
+        let icon_path = if link
+            .GetIconLocation(icon_buf.as_mut_slice(), &mut icon_index)
+            .is_ok()
+            && icon_index == 0
+        {
+            let p = wide_to_string(&icon_buf);
+            let path = std::path::Path::new(&p);
+            let ext_ok = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ico") || e.eq_ignore_ascii_case("exe"));
+            if !p.is_empty() && ext_ok && path.is_file() {
+                Some(p)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Some(ShortcutInfo {
+            target,
+            args,
+            icon_path,
+        })
     }
 }
 
@@ -275,6 +325,32 @@ pub fn launch(entry: &LaunchEntry) -> anyhow::Result<()> {
 }
 
 fn launch_aumid(aumid: &str) -> anyhow::Result<()> {
+    match activate_aumid(aumid) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!("IApplicationActivationManager 激活 {aumid} 失败，回退 ShellExecute: {e}");
+            launch_aumid_shell(aumid)
+        }
+    }
+}
+
+fn activate_aumid(aumid: &str) -> anyhow::Result<()> {
+    use windows::Win32::{
+        System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER},
+        UI::Shell::{ApplicationActivationManager, IApplicationActivationManager, AO_NONE},
+    };
+
+    let _com = crate::com::ComGuard::init_sta();
+    let wide_aumid: Vec<u16> = aumid.encode_utf16().chain([0]).collect();
+    unsafe {
+        let mgr: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        mgr.ActivateApplication(PCWSTR(wide_aumid.as_ptr()), PCWSTR::null(), AO_NONE)?;
+    }
+    Ok(())
+}
+
+fn launch_aumid_shell(aumid: &str) -> anyhow::Result<()> {
     let target = format!("shell:AppsFolder\\{aumid}");
     let wide_target: Vec<u16> = target.encode_utf16().chain([0]).collect();
     let wide_open: Vec<u16> = "open\0".encode_utf16().collect();
@@ -314,5 +390,38 @@ fn launch_exe(path: &str) -> anyhow::Result<()> {
         } else {
             anyhow::bail!("ShellExecuteW failed for path {path}: result={}", result.0 as usize)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_manager_available() {
+        use windows::Win32::{
+            System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER},
+            UI::Shell::{ApplicationActivationManager, IApplicationActivationManager},
+        };
+        let _com = crate::com::ComGuard::init_sta();
+        unsafe {
+            let mgr: windows::core::Result<IApplicationActivationManager> =
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER);
+            assert!(mgr.is_ok(), "CoCreateInstance failed: {mgr:?}");
+        }
+    }
+
+    #[test]
+    fn unregistered_aumid_is_rejected() {
+        assert!(!is_aumid_registered(""));
+        assert!(!is_aumid_registered("NoBang"));
+        assert!(!is_aumid_registered("NonExistent.FakeApp_0000000000000!App"));
+        assert!(resolve_launch_entry(
+            &AppIdentity::Msix {
+                aumid: "NonExistent.FakeApp_0000000000000!App".to_string(),
+            },
+            None,
+        )
+        .is_none());
     }
 }
